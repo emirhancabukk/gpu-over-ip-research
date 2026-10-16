@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use this work, please cite it using these metadata."
+type: software
+title: "GPU over IP: Vulkan on a remote GPU, over plain TCP"
+abstract: "Patches to Mesa's Venus Vulkan driver and to virglrenderer that carry the Venus protocol over an ordinary TCP connection instead of shared memory, with a dated research log of the measurements, bugs and dead ends."
+authors:
+  - given-names: Emirhan
+    family-names: Cabuk
+repository-code: "https://github.com/emirhancabukk/gpu-over-ip-research"
+license:
+  - MIT
+  - CC-BY-4.0
+keywords:
+  - vulkan
+  - mesa
+  - venus
+  - virglrenderer
+  - gpu
+  - api-remoting
+date-released: "2026-10-16"

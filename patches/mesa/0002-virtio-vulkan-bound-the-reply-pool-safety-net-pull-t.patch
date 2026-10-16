@@ -1,4 +1,4 @@
-From 6afb39546957ae046cb2da8206ff388593e136f3 Mon Sep 17 00:00:00 2001
+From ca47c7fcfdc36618b88128ec886260f01a93b5f3 Mon Sep 17 00:00:00 2001
 From: Emirhan Cabuk <emirhancabuk30@gmail.com>
 Date: Fri, 16 Oct 2026 17:45:49 +0300
 Subject: [PATCH 2/2] virtio/vulkan: bound the reply-pool safety-net pull to an
@@ -27,7 +27,7 @@ Status: built, NOT yet verified on a run.
  1 file changed, 40 insertions(+), 1 deletion(-)
 
 diff --git a/src/virtio/vulkan/vn_renderer_vtest.c b/src/virtio/vulkan/vn_renderer_vtest.c
-index 0aec2b1..0927f5f 100644
+index 0aec2b1..72b3256 100644
 --- a/src/virtio/vulkan/vn_renderer_vtest.c
 +++ b/src/virtio/vulkan/vn_renderer_vtest.c
 @@ -696,8 +696,47 @@ vtest_shmem_sync_thread_func(void *arg)
@@ -37,7 +37,7 @@ index 0aec2b1..0927f5f 100644
 +         /* EXPERIMENTAL (Faz 5, 2026-09-04): BOUNDED safety-net window
 +          * instead of the blind full-pool GET this used to do. Measured on
 +          * a real AWS WAN run (see
-+          * experiments/phase4-wan-aws/07-KOK-NEDEN-*.md): this branch
++          * experiments/phase4-wan-aws/07-*.md): this branch
 +          * fired 258 times at offset=0 size=1048576, i.e. 258 MB pulled
 +          * over a 266s run, while the entire useful payload the active
 +          * hook fetched in the same run was ~1.5 KB across 31 delta

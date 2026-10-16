@@ -50,7 +50,7 @@ and how to remove them.
 Before going over the internet, the same patches worked locally over TCP against an
 AMD GPU (`Virtio-GPU Venus (AMD Radeon Graphics (RADV RENOIR))`, Vulkan 1.4,
 `DRIVER_ID_MESA_VENUS`); see
-[`experiments/phase3-lan-transport/vulkaninfo-tcp-BASARILI-cikti.txt`](experiments/phase3-lan-transport/vulkaninfo-tcp-BASARILI-cikti.txt).
+[`experiments/phase3-lan-transport/vulkaninfo-over-tcp-output.txt`](experiments/phase3-lan-transport/vulkaninfo-over-tcp-output.txt).
 
 ## How it works
 
@@ -143,9 +143,9 @@ sequenceDiagram
     S-->>C: blocking, 1 RTT
 ```
 
-The measurements agree with the diagram. At the start of the 4 September run, with
-an RTT of about 89 ms, a ring sync took 174–201 ms (two round trips) and a reply
-sync 81 ms (one).
+The measurements agree with the diagram. In the 4 September run, with an RTT of about
+89 ms, the fast ring syncs took about 175 ms (two round trips) and the fastest reply
+syncs about 80 ms (one).
 
 ### Delay sweep on loopback
 
@@ -168,7 +168,8 @@ limit, so it cannot see problems caused by moving too many bytes. See the
 ### The RTT is already close to physics
 
 TCP connect time from the same home connection to AWS regional endpoints, measured on
-31 August, 7 samples each:
+31 August, 7 samples each (method and distances in
+[`docs/research-notes/rtt-survey-2026-08-31.md`](docs/research-notes/rtt-survey-2026-08-31.md)):
 
 | Region | Median | Min | Max |
 |---|---|---|---|
@@ -179,9 +180,9 @@ TCP connect time from the same home connection to AWS regional endpoints, measur
 | `eu-west-1` Ireland | 92.5 ms | 88.3 | 171.8 |
 | `me-central-1` UAE | 160.3 ms | 157.8 | 164.8 |
 
-Light in fiber covers the roughly 2,000 km from Turkey to Frankfurt and back in about
-20 ms, so the measured 66 ms is about three times the physical floor, which is normal
-for routed commercial internet. Moving to a closer region saves about 10 ms at best.
+Light in fiber covers the 1,867 km from Istanbul to Frankfurt and back in about 19 ms,
+so the measured 66 ms is about 3.5 times the physical floor, which is normal for
+routed commercial internet. Moving to a closer region saves about 10 ms at best.
 Reducing the **number** of round trips is the only lever with real headroom.
 
 ## Optimization history
@@ -217,13 +218,25 @@ That is **258 MB** moved in 266 seconds, while the entire useful payload was abo
 **1.5 KB**. The delta logic runs only when the caller passes a size hint; the
 background thread never passes one, so every pass pulls the whole pool.
 
-The waste is enough to saturate a home downlink, and each 1 MiB pull holds the single
-shared socket for about a second. Small packets such as TCP connect probes still get
-through, so the RTT looks normal while real transfers stall: ring syncs climbed from
-174–201 ms at the start of the run to 755–1,051 ms near the end, and then the
-connection dropped. An earlier session (note 06) saw exactly this picture — flat RTT,
-idle GPU, known-good code — and blamed the internet provider. The loopback bench never
-showed it because loopback has no bandwidth limit.
+The waste is enough to saturate a home downlink: at about 8 Mbps, the average rate of
+the wasted transfer, one 1 MiB pull takes about a second, and it holds the client's
+single socket while it runs. Small packets such as TCP connect probes still get
+through, so the RTT looks normal while real transfers stall. The client's own log of
+the run,
+[`07-data-client-stderr-2026-09-04.txt`](experiments/phase4-wan-aws/07-data-client-stderr-2026-09-04.txt)
+(one `[PROF]` line per sync), shows the fast case disappearing:
+
+| Fifth of the run | Ring syncs | Median | Slower than 600 ms |
+|---|---|---|---|
+| first | 50 | 201 ms | 42% |
+| second | 50 | 748 ms | 78% |
+| third | 50 | 817 ms | 94% |
+| fourth | 50 | 794 ms | 100% |
+| last | 51 | 865 ms | 100% |
+
+Then the connection dropped. An earlier session (note 06) saw exactly this picture —
+flat RTT, idle GPU, known-good code — and blamed the internet provider. The loopback
+bench never showed it because loopback has no bandwidth limit.
 
 The fix keeps the background thread and its 100 ms period (deleting it outright was
 tried and made things worse, for reasons not yet isolated) and limits each pass to an
@@ -413,58 +426,63 @@ fails silently: connections time out instead of being refused.
 | `experiments/phase4-wan-aws/` | Phases 4–5: the real internet, an AWS GPU, performance |
 | `vendor/` | Local clones of Mesa and virglrenderer. Not tracked (about 700 MB). |
 
-The research log is written in **Turkish**, as it was kept during the work. It is
-chronological and unedited: failed attempts stay in, with the reason they failed.
-Where a later finding overturned a note, a dated note at the top says so. An English
-index:
+The notes were kept in Turkish while the work happened and were translated into
+English on 16 October 2026; the original Turkish text is in commit
+[`ad87ea8`](https://github.com/emirhancabukk/gpu-over-ip-research/tree/ad87ea88fcdb3311255b4b22ee3da57a4065fb3d).
+Apart from the translation they are unedited and chronological: failed attempts stay
+in, with the reason they failed, and where a later finding overturned a note, a dated
+note at the top says so. "The user" in the notes is the project's author. An index:
 
 **Phase 0–1** (`docs/research-notes/`)
 
 | File | Summary |
 |---|---|
-| `faz0-network-olcum.md` | Baseline: ~64 ms TCP connect to Frankfurt; ICMP is blocked on the path |
-| `faz0-azure-pivot.md` | AWS GPU quota requests denied; an Azure A10 instance considered instead |
-| `faz1-venus-rvgpu-bulgular.md` | Why Venus (batches per command buffer) and not RVGPU (renders locally, streams the result) |
-| `faz1-kaynak-kod-bulgular.md` | Source reading: the ring assumes truly shared, polled memory; resources travel as fds |
-| `faz1-vtest-transfer-sync-bulgular.md` | `TRANSFER_GET`/`PUT` and `SYNC_WAIT` are plain byte streams, a possible foundation |
+| `phase0-network-measurement.md` | Baseline with curl: ~64 ms to Frankfurt, DNS lookup included; ICMP is blocked on the path |
+| `phase0-azure-pivot.md` | AWS GPU quota requests denied; an Azure A10 instance considered instead |
+| `phase1-prior-art-venus-and-rvgpu.md` | Why Venus (batches per command buffer) and not RVGPU (renders locally, streams the result) |
+| `phase1-source-code-findings.md` | Source reading: the ring assumes truly shared, polled memory; resources travel as fds |
+| `phase1-vtest-transfer-and-sync.md` | `TRANSFER_GET`/`PUT` and `SYNC_WAIT` are plain byte streams, a possible foundation |
+| `rtt-survey-2026-08-31.md` | TCP-connect RTT to six AWS regions against the fiber floor: the path is normal, Milan is 10 ms closer |
 
 **Phase 2: local proof of concept** (`experiments/phase2-local-poc/`)
 
 | File | Summary |
 |---|---|
-| `01-build-ve-smoke-test.md` | virglrenderer with Venus builds and the server starts on a local AMD GPU |
-| `02-mesa-virtio-icd-ve-e2e-deneme.md` | The Mesa Venus driver builds; the first end-to-end run fails with `CONTEXT_FAILED` |
-| `03-context-failed-debug.md` | The partial-read hypothesis is ruled out |
-| `04-context-failed-kok-neden.md` | Root cause: the render server subprocess fails to spawn (`ENOMEM`) |
-| `05-BASARILI-uctan-uca-render.md` | Thread mode: Venus enumerates the real GPU end to end |
+| `01-build-and-smoke-test.md` | virglrenderer with Venus builds and the server starts on a local AMD GPU |
+| `02-mesa-virtio-icd-and-first-e2e-attempt.md` | The Mesa Venus driver builds; the first end-to-end run fails with `CONTEXT_FAILED` |
+| `03-context-failed-debugging.md` | The partial-read hypothesis is ruled out |
+| `04-context-failed-root-cause.md` | Root cause: the render server subprocess fails to spawn (`ENOMEM`) |
+| `05-SUCCESS-end-to-end.md` | Thread mode: Venus enumerates the real GPU end to end |
 
 **Phase 3: TCP transport** (`experiments/phase3-lan-transport/`)
 
 | File | Summary |
 |---|---|
-| `01-tcp-ilk-deneme-fd-passing-engeli.md` | Swapping the socket aborts at the first fd receive |
-| `02-transfer-get-put-blob-uyumsuzlugu.md` | Transfers fail on blob resources; the copy API assumes textures |
-| `03-phantom-byte-fix-ve-timing-sorunu.md` | `GET2`/`PUT2` move 0 bytes; back to opcodes 4/5; the phantom byte |
-| `04-ring-corruption-ve-reply-tazelik-sorunu.md` | Field ownership, buffer before tail, reply pool GET-only, the lock convoy |
-| `05-reply-sync-now-hook-ve-kalan-flaky-cs-error.md` | A synchronous reply pull when the reply is ready fixes stale replies |
-| `06-aktif-push-pull-hook-hiz-arttirdi-yeni-veri-kaybi-bulgusu.md` | Active push/pull hooks: faster, and a new data-loss bug |
-| `07-BASARILI-faz3-tamamlandi.md` | Phase 3 complete: `vulkaninfo` over TCP; three racing sync paths found |
-| `08-tc-netem-yapay-gecikme-sonuclari.md` | Delay sweep: runtime scales linearly with delay |
-| `09-pipelining-denemesi-negatif-sonuc.md` | Pull throttling: no measurable gain |
-| `10-idle-kosullu-push-denemesi-basarisiz-geri-alindi.md` | Idle-conditional push: 3/3 timeouts, reverted |
-| `11-ring-fallback-thread-yeniden-eklendi-guvenli.md` | A 5 ms fallback thread restores delivery guarantees |
+| `01-first-tcp-attempt-fd-passing-blocker.md` | Swapping the socket aborts at the first fd receive |
+| `02-transfer-get-put-blob-mismatch.md` | Transfers fail on blob resources; the copy API assumes textures |
+| `03-phantom-byte-fix-and-timing-issue.md` | `GET2`/`PUT2` move 0 bytes; back to opcodes 4/5; the phantom byte |
+| `04-ring-corruption-and-stale-replies.md` | Field ownership, buffer before tail, reply pool GET-only, the lock convoy |
+| `05-reply-sync-now-hook-and-remaining-flaky-cs-error.md` | A synchronous reply pull when the reply is ready fixes stale replies |
+| `06-active-push-pull-hooks-faster-new-data-loss.md` | Active push/pull hooks: faster, and a new data-loss bug |
+| `07-SUCCESS-phase3-complete.md` | Phase 3 complete: `vulkaninfo` over TCP; three racing sync paths found |
+| `08-tc-netem-artificial-delay-results.md` | Delay sweep: runtime scales linearly with delay |
+| `09-pipelining-attempt-negative-result.md` | Pull throttling: no measurable gain |
+| `10-idle-conditional-push-failed-reverted.md` | Idle-conditional push: 3/3 timeouts, reverted |
+| `11-ring-fallback-thread-restored-safely.md` | A 5 ms fallback thread restores delivery guarantees |
+| `vulkaninfo-over-tcp-output.txt` | Full `vulkaninfo --summary` output from the first successful run over TCP |
 
 **Phases 4–5: the real internet** (`experiments/phase4-wan-aws/`)
 
 | File | Summary |
 |---|---|
-| `01-BASARILI-gercek-aws-gpu-internet-uzerinden.md` | A real AWS GPU over the internet; profiling and the first optimization round |
-| `02-KRITIK-race-condition-bulundu-duzeltildi.md` | Half-written commands reached the host; fixed with a lock, crash gone |
-| `03-device-memory-transport-calisti-ama-yavas.md` | Device memory over TCP: `vkcube` stops crashing, but is far too slow |
-| `04-BASARILI-pipelining-435s-236s.md` | Pipelining: 435 s → 236 s |
-| `05-reply-pool-arka-plan-thread-duzeltmesi-ve-vkcube-durumu.md` | Reply-pool thread 2 ms → 100 ms; where `vkcube` stops |
-| `06-tikanma-agin-degiskenligi-oturum-durduruldu.md` | A stall blamed on the network; overturned by note 07 |
-| `07-KOK-NEDEN-arka-plan-thread-258MB-bosa-transfer.md` | Root cause: 258 MB of wasted transfer per run; the crash in `vtest_read` |
+| `01-SUCCESS-real-aws-gpu-over-the-internet.md` | A real AWS GPU over the internet; profiling and the first optimization round |
+| `02-CRITICAL-race-condition-found-and-fixed.md` | Half-written commands reached the host; fixed with a lock, crash gone |
+| `03-device-memory-transport-works-but-slow.md` | Device memory over TCP: `vkcube` stops crashing, but is far too slow |
+| `04-SUCCESS-pipelining-435s-to-236s.md` | Pipelining: 435 s → 236 s |
+| `05-reply-pool-background-thread-fix-and-vkcube-status.md` | Reply-pool thread 2 ms → 100 ms; where `vkcube` stops |
+| `06-stall-network-variability-session-stopped.md` | A stall blamed on the network; overturned by note 07 |
+| `07-ROOT-CAUSE-background-thread-258MB-wasted-transfer.md` | Root cause: 258 MB of wasted transfer per run; the crash in `vtest_read` |
+| `07-data-client-stderr-2026-09-04.txt` | Raw client stderr of that run: 282 `[PROF]` lines, one per sync |
 
 ## Next steps
 
@@ -491,4 +509,5 @@ In dependency order:
   commercially, with credit.
 
 Mesa and virglrenderer are separate projects with their own authors and licenses;
-this repository contains only the changes.
+this repository contains only the changes. Citation metadata is in
+[`CITATION.cff`](CITATION.cff).

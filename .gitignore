@@ -1,15 +1,15 @@
-# Upstream kaynak ağaçları depoya girmez (~700 MB, kendi git geçmişleri var).
-# Bu ağaçlardaki değişiklikler patches/ altında patch serisi olarak tutulur.
+# Upstream source trees are not tracked (~700 MB, with their own git history).
+# The changes to those trees are kept as patch series under patches/.
 vendor/
 
-# Build çıktıları
+# Build output
 build/
 builddir/
 *.o
 *.so
 *.so.*
 
-# Ölçüm / log çıktıları
+# Measurement / log output
 *.log
 core
 core.*

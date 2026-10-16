@@ -1,0 +1,56 @@
+==========
+VULKANINFO
+==========
+
+Vulkan Instance Version: 1.4.357
+
+
+Instance Extensions: count = 26
+-------------------------------
+VK_EXT_acquire_drm_display             : extension revision 1
+VK_EXT_acquire_xlib_display            : extension revision 1
+VK_EXT_debug_report                    : extension revision 10
+VK_EXT_debug_utils                     : extension revision 2
+VK_EXT_direct_mode_display             : extension revision 1
+VK_EXT_display_surface_counter         : extension revision 1
+VK_EXT_headless_surface                : extension revision 1
+VK_EXT_layer_settings                  : extension revision 2
+VK_EXT_surface_maintenance1            : extension revision 1
+VK_EXT_swapchain_colorspace            : extension revision 5
+VK_KHR_device_group_creation           : extension revision 1
+VK_KHR_display                         : extension revision 23
+VK_KHR_external_fence_capabilities     : extension revision 1
+VK_KHR_external_memory_capabilities    : extension revision 1
+VK_KHR_external_semaphore_capabilities : extension revision 1
+VK_KHR_get_display_properties2         : extension revision 1
+VK_KHR_get_physical_device_properties2 : extension revision 2
+VK_KHR_get_surface_capabilities2       : extension revision 1
+VK_KHR_portability_enumeration         : extension revision 1
+VK_KHR_surface                         : extension revision 25
+VK_KHR_surface_maintenance1            : extension revision 1
+VK_KHR_surface_protected_capabilities  : extension revision 1
+VK_KHR_wayland_surface                 : extension revision 6
+VK_KHR_xcb_surface                     : extension revision 6
+VK_KHR_xlib_surface                    : extension revision 6
+VK_LUNARG_direct_driver_loading        : extension revision 1
+
+Instance Layers: count = 2
+--------------------------
+VK_LAYER_MESA_anti_lag      Open-source implementation of the VK_AMD_anti_lag extension. 1.4.303  version 1
+VK_LAYER_MESA_device_select Linux device selection layer                                 1.4.303  version 1
+
+Devices:
+========
+GPU0:
+	apiVersion         = 1.4.354
+	driverVersion      = 26.2.99
+	vendorID           = 0x1002
+	deviceID           = 0x164c
+	deviceType         = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+	deviceName         = Virtio-GPU Venus (AMD Radeon Graphics (RADV RENOIR))
+	driverID           = DRIVER_ID_MESA_VENUS
+	driverName         = venus
+	driverInfo         = Mesa 26.3.0-devel (git-e9a87f80b2)
+	conformanceVersion = 1.4.0.0
+	deviceUUID         = f009c1f2-4a04-1c26-e9ae-cfb004354ab1
+	driverUUID         = b696fa8a-1982-59a4-b82a-9953297ac10c

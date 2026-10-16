@@ -1,0 +1,84 @@
+From 6afb39546957ae046cb2da8206ff388593e136f3 Mon Sep 17 00:00:00 2001
+From: Emirhan Cabuk <emirhancabuk30@gmail.com>
+Date: Fri, 16 Oct 2026 17:45:49 +0300
+Subject: [PATCH 2/2] virtio/vulkan: bound the reply-pool safety-net pull to an
+ 8 KiB window
+
+The reply-pool background sync thread pulled the whole 1 MiB pool on
+every pass, because the delta logic in vtest_shmem_sync_now() only runs
+when a hint_size is given and the thread never passes one.
+
+Measured over a real WAN run (Turkey -> AWS Frankfurt, 266 s): 258 full
+1 MiB GETs (258 MB) from this thread, against 31 delta GETs of 24-64
+bytes (~1.5 KB) from the active hook -- the entire useful payload. The
+waste saturates a home downlink and holds the single socket for about a
+second per pull, so ring syncs climbed from 174-201 ms early in the run
+to 755-1051 ms before the connection dropped.
+
+Keep the thread and its 100 ms period (removing the branch entirely was
+tried and reverted: it regressed for reasons not yet isolated), and pull
+only a small window starting at last_synced_size. last_synced_size is
+not advanced here: the active hook owns it, and a duplicate pull is
+harmless while a skipped span is not.
+
+Status: built, NOT yet verified on a run.
+---
+ src/virtio/vulkan/vn_renderer_vtest.c | 41 ++++++++++++++++++++++++++-
+ 1 file changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/src/virtio/vulkan/vn_renderer_vtest.c b/src/virtio/vulkan/vn_renderer_vtest.c
+index 0aec2b1..0927f5f 100644
+--- a/src/virtio/vulkan/vn_renderer_vtest.c
++++ b/src/virtio/vulkan/vn_renderer_vtest.c
+@@ -696,8 +696,47 @@ vtest_shmem_sync_thread_func(void *arg)
+           * 2ms, which caused the mutex-starvation hang documented in
+           * experiments/phase4-wan-aws/05-*.md) rather than either
+           * extreme. */
++         /* EXPERIMENTAL (Faz 5, 2026-09-04): BOUNDED safety-net window
++          * instead of the blind full-pool GET this used to do. Measured on
++          * a real AWS WAN run (see
++          * experiments/phase4-wan-aws/07-KOK-NEDEN-*.md): this branch
++          * fired 258 times at offset=0 size=1048576, i.e. 258 MB pulled
++          * over a 266s run, while the entire useful payload the active
++          * hook fetched in the same run was ~1.5 KB across 31 delta
++          * transfers of 24-64 bytes each. That continuous ~7.8 Mbps of
++          * wasted download saturates a home uplink's return path, which is
++          * what actually produced the "throughput degraded but RTT is
++          * flat" picture note 06 attributed to the ISP: small TCP probes
++          * still get through the queue (RTT looks fine) while real ring
++          * syncs stall (measured climbing from 174-201ms early in the run
++          * to 755-1051ms by the time it died).
++          *
++          * Fix shape is deliberately minimal: keep this branch and keep
++          * the validated 100ms period (fully REMOVING the branch was tried
++          * and reverted -- see the comment above -- and the reason it
++          * regressed is still not isolated, so transfer size is kept as
++          * the single changed variable). Pull only a small window starting
++          * where the active hook has synced up to; a reply is small and
++          * this path only needs to catch what that hook missed.
++          *
++          * last_synced_size is deliberately NOT advanced here: the active
++          * hook owns that counter, and advancing it from this thread would
++          * make the hook skip a span it never pulled at the correct,
++          * hint-derived size. A duplicate pull is harmless; a skipped one
++          * is not. The read below can race with the hook's update (it
++          * publishes after dropping sock_mutex), which at worst means this
++          * safety net pulls a slightly older window -- acceptable, since
++          * it is a backstop rather than the correctness path. */
+          mtx_lock(&vtest->sock_mutex);
+-         vtest_vcmd_transfer_get2(vtest, res_id, ptr, size, 0);
++         const size_t synced = shmem->last_synced_size;
++         if (synced < size) {
++            const uint32_t get_offset = (uint32_t)synced;
++            uint32_t window = 8u * 1024u;
++            if (get_offset + window > size)
++               window = size - get_offset;
++            vtest_vcmd_transfer_get2(vtest, res_id, ptr + get_offset, window,
++                                     get_offset);
++         }
+          mtx_unlock(&vtest->sock_mutex);
+       } else {
+          mtx_lock(&vtest->sock_mutex);
+-- 
+2.56.0
+

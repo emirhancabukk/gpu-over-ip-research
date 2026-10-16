@@ -1,0 +1,16 @@
+# Upstream kaynak ağaçları depoya girmez (~700 MB, kendi git geçmişleri var).
+# Bu ağaçlardaki değişiklikler patches/ altında patch serisi olarak tutulur.
+vendor/
+
+# Build çıktıları
+build/
+builddir/
+*.o
+*.so
+*.so.*
+
+# Ölçüm / log çıktıları
+*.log
+core
+core.*
+!experiments/**/*.txt

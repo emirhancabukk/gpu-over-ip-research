@@ -1,0 +1,1094 @@
+From fb4987d45d9380f1ecac031dfadcf14909d0b62a Mon Sep 17 00:00:00 2001
+From: Emirhan Cabuk <emirhancabuk30@gmail.com>
+Date: Mon, 31 Aug 2026 16:33:20 +0300
+Subject: [PATCH 1/2] virtio/vulkan: TCP transport for vtest with shared-memory
+ emulation
+
+Venus normally shares the command ring and reply pool with the host as
+real shared memory (memfd + SCM_RIGHTS + MAP_SHARED). Neither fd passing
+nor shared memory exists across a TCP socket, so coherence is emulated
+on the wire.
+
+- vtest_connect_socket_tcp: accept "tcp:<host>:<port>" in
+  VTEST_SOCKET_NAME, AF_INET + TCP_NODELAY.
+- vtest_shmem_create: fall back to MAP_SHARED|MAP_ANONYMOUS when no fd
+  can be received.
+- vtest_shmem_sync_ring_cycle: field-ownership-aware sync. Only
+  guest-owned regions (tail, buffer) are PUT, only host-owned regions
+  (head, status, extra) are GET. Blind bidirectional copying corrupted
+  both sides. Buffer is pushed before tail to preserve SPSC discipline.
+- Ring delta-push: track ring->cur and PUT only [last_pushed, cur),
+  not the full 128 KiB buffer. Wrap-around handled as a two-part PUT.
+- Merge the head (offset 0) and status (offset 128) GET into one
+  round trip.
+- Reply pool is GET-only (host is sole writer) and delta-pulled via a
+  hint_size parameter plus last_synced_size state, so only
+  [last_synced_size, hint_size) crosses the wire.
+- Fix a race where ring->cur was read outside the mutex while
+  last_pushed_cur was updated inside it, letting last_pushed_cur move
+  backwards and abort in vn_ring_submit_internal.
+- Pipelining: drop the unconditional shmem_sync_now at submit time.
+  Async commands no longer each pay a round trip; delivery is
+  guaranteed by the next synchronous wait_seqno or by the low-frequency
+  background thread. Measured 435s -> 236s over a real WAN link.
+- Background sync thread period relaxed to 100 ms for the reply pool.
+- Suppress the AF_UNIX dummy byte in vtest_send_fd on TCP, which
+  otherwise desynchronised the byte stream.
+- vtest_vcmd_sync_wait: no fd to poll on TCP, return success. Correct
+  for enumeration workloads only; real async fences need a host->guest
+  notification channel.
+
+Base: e9a87f8 (upstream/main)
+---
+ src/virtio/vulkan/vn_renderer.h       |  70 +++
+ src/virtio/vulkan/vn_renderer_vtest.c | 685 +++++++++++++++++++++++++-
+ src/virtio/vulkan/vn_ring.c           |  91 ++++
+ 3 files changed, 824 insertions(+), 22 deletions(-)
+
+diff --git a/src/virtio/vulkan/vn_renderer.h b/src/virtio/vulkan/vn_renderer.h
+index ea224ea..9c2f9c9 100644
+--- a/src/virtio/vulkan/vn_renderer.h
++++ b/src/virtio/vulkan/vn_renderer.h
+@@ -133,6 +133,48 @@ struct vn_renderer_shmem_ops {
+                                        size_t size);
+    void (*destroy)(struct vn_renderer *renderer,
+                    struct vn_renderer_shmem *shmem);
++   /* EXPERIMENTAL (Faz 3, GPU-over-IP research): optional (NULL for
++    * renderers that don't need it, e.g. real virtio-gpu with true shared
++    * memory). Forces an immediate, synchronous refresh of this shmem's
++    * local mapping from the host's copy. Used to close a happens-before
++    * gap in the TCP/vtest transport: our reply-pool shmem is normally
++    * kept "fresh" by a background poll thread, but that thread's cadence
++    * gives no hard guarantee the latest host-written reply has landed by
++    * the time vn_ring_wait_seqno() returns and the caller reads it. Right
++    * after that return is exactly the one point where we *know* (from
++    * Venus's own ordering guarantee: host never advances the ring seqno
++    * before finishing the reply write) that a fresh pull will see the
++    * real data -- see the call site in vn_ring.c. */
++   /* EXPERIMENTAL (Faz 4, AWS WAN perf): hint_size, when nonzero and
++    * smaller than the shmem's full size, tells the renderer it only needs
++    * to refresh the first hint_size bytes (the caller knows that's all
++    * that could possibly be valid/used right now, e.g. reply_shmem_pool's
++    * own `used` byte count) instead of pulling the whole shmem over the
++    * network. A renderer is free to ignore this and always pull the full
++    * size; it's purely an optimization hint, never a correctness
++    * requirement. Pass 0 to request a full sync (original behavior). */
++   void (*sync_now)(struct vn_renderer *renderer,
++                    struct vn_renderer_shmem *shmem,
++                    size_t hint_size);
++
++   /* EXPERIMENTAL (Faz 4, AWS WAN correctness fix): optional (NULL for
++    * renderers that don't need it, e.g. real virtio-gpu, which has no
++    * concurrent background copier touching the shmem). vn_ring_submit's
++    * write-then-publish sequence (vn_ring_write_buffer, then
++    * vn_ring_store_tail, then a sync_now push) is only atomic against a
++    * renderer's own background sync thread if the renderer says so --
++    * nothing in vn_ring.c itself takes any lock around that sequence.
++    * Reproduced without this: over a real WAN link with multi-second
++    * sync_now round trips, the vtest renderer's low-frequency background
++    * copier could win the shmem lock in the middle of the guest's own
++    * write_buffer loop and PUT a partially-written ring buffer to the
++    * host -- decoded there as "32 bytes correct, rest zero", a fatal CS
++    * error (see experiments/phase4-wan-aws/). Call lock() before writing
++    * to a shmem that a background thread might also touch, unlock() when
++    * done publishing. */
++   void (*lock)(struct vn_renderer *renderer, struct vn_renderer_shmem *shmem);
++   void (*unlock)(struct vn_renderer *renderer,
++                  struct vn_renderer_shmem *shmem);
+ };
+ 
+ struct vn_renderer_bo_ops {
+@@ -284,6 +326,34 @@ vn_renderer_shmem_create(struct vn_renderer *renderer, size_t size)
+    return shmem;
+ }
+ 
++/* EXPERIMENTAL (Faz 3): see the comment on vn_renderer_shmem_ops::sync_now.
++ * No-op when the renderer doesn't provide sync_now or shmem is NULL. */
++static inline void
++vn_renderer_shmem_sync_now(struct vn_renderer *renderer,
++                           struct vn_renderer_shmem *shmem,
++                           size_t hint_size)
++{
++   if (shmem && renderer->shmem_ops.sync_now)
++      renderer->shmem_ops.sync_now(renderer, shmem, hint_size);
++}
++
++/* EXPERIMENTAL (Faz 4): see the comment on vn_renderer_shmem_ops::lock. */
++static inline void
++vn_renderer_shmem_lock(struct vn_renderer *renderer,
++                       struct vn_renderer_shmem *shmem)
++{
++   if (shmem && renderer->shmem_ops.lock)
++      renderer->shmem_ops.lock(renderer, shmem);
++}
++
++static inline void
++vn_renderer_shmem_unlock(struct vn_renderer *renderer,
++                         struct vn_renderer_shmem *shmem)
++{
++   if (shmem && renderer->shmem_ops.unlock)
++      renderer->shmem_ops.unlock(renderer, shmem);
++}
++
+ static inline struct vn_renderer_shmem *
+ vn_renderer_shmem_ref(struct vn_renderer *renderer,
+                       struct vn_renderer_shmem *shmem)
+diff --git a/src/virtio/vulkan/vn_renderer_vtest.c b/src/virtio/vulkan/vn_renderer_vtest.c
+index 298ebd6..0aec2b1 100644
+--- a/src/virtio/vulkan/vn_renderer_vtest.c
++++ b/src/virtio/vulkan/vn_renderer_vtest.c
+@@ -7,8 +7,10 @@
+  */
+ 
+ #include "virtio/virtio-gpu/venus_hw.h"
++#include <arpa/inet.h>
+ #include <errno.h>
+ #include <netinet/in.h>
++#include <netinet/tcp.h>
+ #include <poll.h>
+ #include <sys/mman.h>
+ #include <sys/socket.h>
+@@ -32,6 +34,42 @@ struct vtest;
+ 
+ struct vtest_shmem {
+    struct vn_renderer_shmem base;
++
++   /* EXPERIMENTAL (Faz 3): under TCP transport there is no SCM_RIGHTS fd to
++    * mmap MAP_SHARED with the host, so this shmem is backed by a local
++    * anonymous mapping and a background thread periodically pushes/pulls
++    * its contents to/from the host via transfer_put2/transfer_get2 to
++    * emulate coherency. Known limitation: no locking against concurrent
++    * vn_ring writes into the same memory -- good enough to prove the
++    * transport works, not yet safe/fast. See experiments/phase3-lan-transport/.
++    */
++   struct vtest *sync_vtest;
++   thrd_t sync_thread;
++   atomic_bool sync_running;
++   bool sync_active;
++
++   /* EXPERIMENTAL (Faz 4, AWS WAN perf): tracks the ring "cur" counter value
++    * (same monotonic counter as vn_ring's own ring->cur / the tail field --
++    * see vn_ring_write_buffer() in vn_ring.c) as of the last time we PUT the
++    * buffer to the host, so the next cycle only needs to push the bytes
++    * actually written since then instead of the full 128KB every time. See
++    * experiments/phase4-wan-aws/ for the profiling that motivated this. */
++   uint32_t last_pushed_cur;
++   bool last_pushed_cur_valid;
++
++   /* EXPERIMENTAL (Faz 4, AWS WAN perf): for the reply_shmem_pool, tracks
++    * how many bytes from offset 0 we've already pulled. reply_shmem_pool's
++    * `used` counter (passed in as hint_size) is a bump allocator that only
++    * ever grows across the whole instance lifetime -- it does NOT mean
++    * "this call's reply size", it means "cumulative total ever allocated".
++    * Pulling [0, used) every time re-fetches every earlier call's reply
++    * data all over again, growing without bound over a run (this is what
++    * made the very first profiling look great -- ~60ms -- and the full
++    * vulkaninfo run look no better than before -- ~510ms average -- despite
++    * the "optimization": early calls had small `used`, later calls had
++    * `used` approaching the full 1MB). Only pulling the new
++    * [last_synced_size, hint_size) span fixes this for real. */
++   size_t last_synced_size;
+ };
+ 
+ struct vtest_bo {
+@@ -53,6 +91,11 @@ struct vtest {
+ 
+    mtx_t sock_mutex;
+    int sock_fd;
++   /* EXPERIMENTAL (Faz 3): true when connected via "tcp:host:port" instead
++    * of a unix socket -- SCM_RIGHTS fd-passing is unavailable, so blob
++    * resources fall back to a local-memory + transfer_get2/put2 emulation.
++    */
++   bool is_tcp;
+ 
+    uint32_t protocol_version;
+    uint32_t max_timeline_count;
+@@ -71,12 +114,61 @@ struct vtest {
+    struct vn_renderer_shmem_cache shmem_cache;
+ };
+ 
++/* EXPERIMENTAL (Faz 3, GPU-over-IP research): if path is "tcp:<host>:<port>",
++ * connect over TCP instead of a unix domain socket. This lets the vtest
++ * renderer run on a remote machine (e.g. a cloud GPU instance) instead of
++ * requiring guest and host to share a filesystem/unix socket namespace.
++ */
++static int
++vtest_connect_socket_tcp(struct vn_instance *instance, const char *spec)
++{
++   char host[256];
++   const char *rest = spec + 4; /* skip "tcp:" */
++   const char *colon = strrchr(rest, ':');
++   if (!colon || (size_t)(colon - rest) >= sizeof(host))
++      return -1;
++
++   memcpy(host, rest, colon - rest);
++   host[colon - rest] = '\0';
++   const int port = atoi(colon + 1);
++
++   const int sock = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
++   if (sock < 0)
++      return -1;
++
++   struct sockaddr_in addr;
++   memset(&addr, 0, sizeof(addr));
++   addr.sin_family = AF_INET;
++   addr.sin_port = htons((uint16_t)port);
++   if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
++      close(sock);
++      return -1;
++   }
++
++   if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
++      if (VN_DEBUG(INIT)) {
++         vn_log(instance, "failed to connect to tcp %s:%d: %s", host, port,
++                strerror(errno));
++      }
++      close(sock);
++      return -1;
++   }
++
++   const int one = 1;
++   setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
++
++   return sock;
++}
++
+ static int
+ vtest_connect_socket(struct vn_instance *instance, const char *path)
+ {
+    struct sockaddr_un un;
+    int sock;
+ 
++   if (strncmp(path, "tcp:", 4) == 0)
++      return vtest_connect_socket_tcp(instance, path);
++
+    sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (sock < 0) {
+       if (VN_DEBUG(INIT))
+@@ -317,6 +409,344 @@ vtest_vcmd_context_init(struct vtest *vtest, uint32_t capset_id)
+    vtest_write(vtest, vcmd_context_init, sizeof(vcmd_context_init));
+ }
+ 
++/* EXPERIMENTAL (Faz 3): client-side counterparts of the server's
++ * transfer_get2/put2 handlers (vtest_transfer_get_internal/put_internal in
++ * virglrenderer), used only in TCP mode to emulate shared-memory coherency
++ * for blob resources. Treated as a flat 1D buffer (level 0, width=size,
++ * height=depth=1), matching how the server interprets the transfer box.
++ */
++/* NOTE (Faz 3, corrected): VCMD_TRANSFER_PUT2/GET2 turned out to silently
++ * ignore the client-sent size (server's vtest_transfer_decode_args2 never
++ * reads a DATA_SIZE field at all -- confirmed by reading vtest_renderer.c),
++ * so the wrapper functions that call *_internal() with data_size always
++ * pass 0 for the "2" opcodes, causing a 0-byte transfer while our client
++ * still wrote/expected `size` bytes -> stream desync. The *original*
++ * VCMD_TRANSFER_GET/PUT (opcodes 4/5, 11-dword header incl. DATA_SIZE) do
++ * wire the size through (vtest_transfer_decode_args reads
++ * thdr_buf[VCMD_TRANSFER_DATA_SIZE]) -- use those instead. */
++static void
++vtest_vcmd_transfer_put2(struct vtest *vtest, uint32_t res_id,
++                         const void *data, uint32_t size, uint32_t offset)
++{
++   uint32_t vtest_hdr[VTEST_HDR_SIZE];
++   uint32_t args[VCMD_TRANSFER_HDR_SIZE];
++
++   vtest_hdr[VTEST_CMD_LEN] = VCMD_TRANSFER_HDR_SIZE + (size + 3) / 4;
++   vtest_hdr[VTEST_CMD_ID] = VCMD_TRANSFER_PUT;
++
++   memset(args, 0, sizeof(args));
++   args[VCMD_TRANSFER_RES_HANDLE] = res_id;
++   args[VCMD_TRANSFER_STRIDE] = size;
++   args[VCMD_TRANSFER_LAYER_STRIDE] = size;
++   args[VCMD_TRANSFER_WIDTH] = size;
++   args[VCMD_TRANSFER_HEIGHT] = 1;
++   args[VCMD_TRANSFER_DEPTH] = 1;
++   args[VCMD_TRANSFER_DATA_SIZE] = size;
++   /* EXPERIMENTAL: the legacy PUT/GET wire format has no real offset field
++    * (server hardcodes args->offset=0). We repurpose the unused X box
++    * coordinate to carry our own byte offset -- the server-side blob
++    * fast path (added for Faz 3) reads it back via args->box.x instead of
++    * args->offset, so this is scoped entirely to our own blob code path
++    * and doesn't affect classic (non-blob) texture transfers. */
++   args[VCMD_TRANSFER_X] = offset;
++
++   vtest_write(vtest, vtest_hdr, sizeof(vtest_hdr));
++   vtest_write(vtest, args, sizeof(args));
++   if (size)
++      vtest_write(vtest, data, size);
++}
++
++static void
++vtest_vcmd_transfer_get2(struct vtest *vtest, uint32_t res_id, void *data,
++                         uint32_t size, uint32_t offset)
++{
++   uint32_t vtest_hdr[VTEST_HDR_SIZE];
++   uint32_t args[VCMD_TRANSFER_HDR_SIZE];
++
++   vtest_hdr[VTEST_CMD_LEN] = VCMD_TRANSFER_HDR_SIZE;
++   vtest_hdr[VTEST_CMD_ID] = VCMD_TRANSFER_GET;
++
++   memset(args, 0, sizeof(args));
++   args[VCMD_TRANSFER_RES_HANDLE] = res_id;
++   args[VCMD_TRANSFER_STRIDE] = size;
++   args[VCMD_TRANSFER_LAYER_STRIDE] = size;
++   args[VCMD_TRANSFER_WIDTH] = size;
++   args[VCMD_TRANSFER_HEIGHT] = 1;
++   args[VCMD_TRANSFER_DEPTH] = 1;
++   args[VCMD_TRANSFER_DATA_SIZE] = size;
++   /* see matching comment in vtest_vcmd_transfer_put2() */
++   args[VCMD_TRANSFER_X] = offset;
++
++   vtest_write(vtest, vtest_hdr, sizeof(vtest_hdr));
++   vtest_write(vtest, args, sizeof(args));
++   if (size)
++      vtest_read(vtest, data, size);
++}
++
++/* EXPERIMENTAL (Faz 3, corrected): the primary Venus ring's shmem is laid
++ * out by vn_ring_get_layout() (vn_ring.c) as:
++ *   [0]      head   (4B)  -- HOST-owned: host advances as it consumes cmds
++ *   [64]     tail   (4B)  -- GUEST-owned: guest advances as it enqueues
++ *   [128]    status (4B)  -- HOST-owned: e.g. the periodic ALIVE heartbeat
++ *   [192]    buffer (128KiB) -- GUEST-owned: the command data itself
++ *   [131264] extra  (4B)  -- HOST-owned (never written by the guest side)
++ *   total shmem_size = 131268, matching vn_instance.c's fixed
++ *   buf_size=128*1024 / extra_size=4 for the primary ring.
++ *
++ * A blind whole-buffer bidirectional copy (PUT everything, then GET
++ * everything) was found to corrupt this: every PUT re-pushes the guest's
++ * stale local copy of the HOST-owned fields (head/status), silently
++ * reverting any progress the host made between our cycles -- e.g. erasing
++ * the host's ALIVE heartbeat and even rolling back its own `head` pointer.
++ * This reliably starved vn_relax's watchdog, aborting well within its
++ * budget regardless of polling speed. Fix: only PUT the guest-owned
++ * ranges (tail, buffer) and only GET the host-owned ranges (head, status,
++ * extra) -- never let one side's blind copy stomp the other's fields.
++ * Uses the box.x-as-offset extension (see vtest_vcmd_transfer_put2/get2)
++ * since the legacy PUT/GET opcode has no real offset field of its own.
++ */
++#define VN_RING_HEAD_OFFSET 0
++#define VN_RING_TAIL_OFFSET 64
++#define VN_RING_STATUS_OFFSET 128
++#define VN_RING_BUFFER_OFFSET 192
++#define VN_RING_BUFFER_SIZE (128 * 1024)
++#define VN_RING_EXTRA_OFFSET (VN_RING_BUFFER_OFFSET + VN_RING_BUFFER_SIZE)
++#define VN_RING_EXTRA_SIZE 4
++#define VN_RING_SHMEM_SIZE (VN_RING_EXTRA_OFFSET + VN_RING_EXTRA_SIZE)
++
++static void
++vtest_shmem_sync_ring_cycle(struct vtest *vtest, struct vtest_shmem *shmem)
++{
++   const uint32_t res_id = shmem->base.res_id;
++   char *ptr = shmem->base.mmap_ptr;
++
++   /* EXPERIMENTAL: one critical section for the whole cycle. An earlier
++    * version split this into 5 separate lock/unlock pairs to be "fairer"
++    * to the reply-pool sync thread, but that over-corrected: the ring is
++    * the actual critical path (nothing else can make progress until it
++    * delivers), and splitting it let the reply-pool thread win the mutex
++    * so often that the ring itself starved instead, so the host never
++    * got far enough to have a reply to write. Keep the ring's cycle
++    * atomic and let the inter-cycle sleep below be the fairness point
++    * instead (tuned so the reply-pool thread, which sleeps longer, still
++    * gets turns without starving the ring). */
++   mtx_lock(&vtest->sock_mutex);
++
++   /* EXPERIMENTAL (Faz 4, AWS WAN perf, bugfix): must read `cur` AFTER
++    * taking the mutex, not before. This function runs concurrently from
++    * two callers -- the low-frequency background thread and the active
++    * sync_now hook -- and last_pushed_cur is only mutex-protected at the
++    * point it's compared/updated below. Reading `cur` outside the lock let
++    * a thread capture a stale snapshot, lose the race for the mutex to the
++    * other thread (which pushes using a newer cur and advances
++    * last_pushed_cur past what the stale thread saw), and then overwrite
++    * last_pushed_cur backwards with its own older value once it finally
++    * got the lock -- corrupting the delta bookkeeping. Reproduced as
++    * vn_ring_submit_internal() aborting (ring assert) after several
++    * seconds of the ring cycle intermittently taking 2-5s per call instead
++    * of ~120ms -- see experiments/phase4-wan-aws/. */
++   uint32_t cur;
++   memcpy(&cur, ptr + VN_RING_TAIL_OFFSET, 4);
++
++   /* EXPERIMENTAL (Faz 4, AWS WAN perf): only push the bytes actually
++    * written since our last cycle instead of the full 128KB buffer every
++    * time. Profiling a real vulkaninfo run over a real AWS WAN link (see
++    * experiments/phase4-wan-aws/) found sync_now round trips averaging
++    * ~730ms and dominating >85% of total time; pushing all 128KB on every
++    * single-command ring cycle (when usually only a few hundred bytes
++    * actually changed) was a direct contributor. ring->cur (mirrored into
++    * the tail field -- see vn_ring_write_buffer() in vn_ring.c) is a
++    * monotonic counter, so cur - last_pushed_cur (unsigned wraparound-safe
++    * subtraction) gives the exact number of new bytes. Falls back to a
++    * full-buffer push on the first cycle, or if somehow more than a full
++    * buffer's worth landed between cycles. */
++   const uint32_t delta = shmem->last_pushed_cur_valid
++                              ? cur - shmem->last_pushed_cur
++                              : VN_RING_BUFFER_SIZE;
++   if (delta > 0 && delta < VN_RING_BUFFER_SIZE) {
++      const uint32_t mask = VN_RING_BUFFER_SIZE - 1;
++      const uint32_t start = shmem->last_pushed_cur & mask;
++      if (start + delta <= VN_RING_BUFFER_SIZE) {
++         vtest_vcmd_transfer_put2(vtest, res_id,
++                                  ptr + VN_RING_BUFFER_OFFSET + start, delta,
++                                  VN_RING_BUFFER_OFFSET + start);
++      } else {
++         const uint32_t first = VN_RING_BUFFER_SIZE - start;
++         vtest_vcmd_transfer_put2(vtest, res_id,
++                                  ptr + VN_RING_BUFFER_OFFSET + start, first,
++                                  VN_RING_BUFFER_OFFSET + start);
++         vtest_vcmd_transfer_put2(vtest, res_id, ptr + VN_RING_BUFFER_OFFSET,
++                                  delta - first, VN_RING_BUFFER_OFFSET);
++      }
++   } else if (delta >= VN_RING_BUFFER_SIZE) {
++      vtest_vcmd_transfer_put2(vtest, res_id, ptr + VN_RING_BUFFER_OFFSET,
++                               VN_RING_BUFFER_SIZE, VN_RING_BUFFER_OFFSET);
++   }
++   shmem->last_pushed_cur = cur;
++   shmem->last_pushed_cur_valid = true;
++
++   /* push guest-owned fields -- buffer content MUST land before the tail
++    * pointer that publishes it: the host runs an independent ring-consumer
++    * thread that wakes on tail changes and immediately decodes up to the
++    * new tail, concurrently with our own main-thread dispatch loop. If we
++    * published tail first, that consumer thread could race ahead and
++    * decode stale/old buffer bytes before the PUT above lands, corrupting
++    * the venus command stream (this was exactly the "vkCreateInstance
++    * resulted in CS error" / "vn_dispatch_command failed" failure seen
++    * before this fix). Publish data, then the index -- the same discipline
++    * a lock-free SPSC ring needs. */
++   vtest_vcmd_transfer_put2(vtest, res_id, ptr + VN_RING_TAIL_OFFSET, 4,
++                            VN_RING_TAIL_OFFSET);
++
++   /* pull host-owned fields: head (offset 0) and status (offset 128) are
++    * close enough that pulling the whole [0, VN_RING_STATUS_OFFSET+4) span
++    * in ONE round trip instead of two separate GETs is a straight win (the
++    * unused gap bytes in between are just discarded). extra sits right
++    * after the 128KB buffer, far away, so it stays its own GET rather than
++    * pulling the whole buffer-sized gap to reach it. */
++   char head_and_status[VN_RING_STATUS_OFFSET + 4];
++   vtest_vcmd_transfer_get2(vtest, res_id, head_and_status,
++                            sizeof(head_and_status), VN_RING_HEAD_OFFSET);
++   memcpy(ptr + VN_RING_HEAD_OFFSET, head_and_status, 4);
++   memcpy(ptr + VN_RING_STATUS_OFFSET,
++          head_and_status + VN_RING_STATUS_OFFSET, 4);
++
++   vtest_vcmd_transfer_get2(vtest, res_id, ptr + VN_RING_EXTRA_OFFSET, 4,
++                            VN_RING_EXTRA_OFFSET);
++   mtx_unlock(&vtest->sock_mutex);
++}
++
++/* EXPERIMENTAL (Faz 3): background thread that keeps a TCP-mode blob's
++ * local anonymous mapping approximately coherent with the host's copy.
++ * For the primary ring (identified by its fixed size -- see comment above)
++ * this does a field-aware, ownership-respecting sync; for any other blob
++ * (e.g. the "reply" shmem used for synchronous call results) it falls back
++ * to a blind whole-buffer push-then-pull, which is fine there since that
++ * resource has no producer/consumer header fields to corrupt. Crude and
++ * unlocked against concurrent vn_ring writes from the main thread either
++ * way -- this only exists to prove the WAN transport can work end-to-end;
++ * a real implementation would need proper synchronization, not polling.
++ */
++static int
++vtest_shmem_sync_thread_func(void *arg)
++{
++   struct vtest_shmem *shmem = arg;
++   struct vtest *vtest = shmem->sync_vtest;
++   const uint32_t res_id = shmem->base.res_id;
++   char *ptr = shmem->base.mmap_ptr;
++   const uint32_t size = (uint32_t)shmem->base.mmap_size;
++   const bool is_ring = size == VN_RING_SHMEM_SIZE;
++   /* EXPERIMENTAL: instance->reply_shmem_pool is fixed at 1u<<20 bytes
++    * (vn_instance.c). This pool backs synchronous call replies: the host
++    * is the sole writer of actual reply bytes, the guest only reads them
++    * (pool bookkeeping/offsets are tracked purely client-side, never
++    * stored in the blob itself). A blind bidirectional PUT+GET here hits
++    * the exact same self-inflicted corruption the ring did: our PUT
++    * blindly re-pushes the guest's stale local copy, racing with and
++    * sometimes clobbering the reply the host just wrote, right before our
++    * own GET reads it back -- this produced the observed
++    * "vn_decode_vkEnumerateInstanceVersion_reply: Assertion
++    * command_type == ... failed" corruption. Fix: never PUT this
++    * resource, GET-only. */
++   const bool is_reply_pool = size == (1u << 20);
++
++   fprintf(stderr, "[DEBUG] sync thread started: res_id=%u size=%u is_ring=%d is_reply_pool=%d\n",
++           res_id, size, is_ring, is_reply_pool);
++   fflush(stderr);
++
++   while (atomic_load_explicit(&shmem->sync_running, memory_order_acquire)) {
++      /* EXPERIMENTAL (Faz 5, tur 14): this thread previously skipped the
++       * ring entirely once precise active push/pull hooks were added
++       * (vn_ring_submit_internal / vn_ring_wait_seqno in vn_ring.c) --
++       * running both this thread's independent 200us cycle AND the
++       * active hooks for the same resource caused a real corruption bug
++       * (see experiments/phase3-lan-transport/06-*.md, Bug #8 in 07-*.md).
++       * But going the OTHER direction and making the active push
++       * conditional (skip it when the host wasn't last observed idle,
++       * trusting *something* to deliver it later) turned out to be
++       * actively unsafe with NO fallback path at all: an async call
++       * (vn_async_vkFoo, never calls vn_ring_wait_seqno) could skip the
++       * push and then nothing ever delivers its data -- reproduced as a
++       * permanent hang (experiments/phase3-lan-transport/10-*.md). That
++       * conditional-push change was reverted (push is unconditional
++       * again), but this thread is reinstated as a low-frequency SAFETY
++       * NET for the ring specifically: 5ms here (25x slower than the old
++       * 200us) vs. the active hooks' effectively-immediate cadence should
++       * make interleaving collisions rare without reintroducing the old
++       * starvation-driven corruption -- to be measured, not assumed. */
++      if (is_ring) {
++         vtest_shmem_sync_ring_cycle(vtest, shmem);
++         struct timespec ring_ts = { .tv_nsec = 5 * 1000 * 1000 }; /* 5ms */
++         thrd_sleep(&ring_ts, NULL);
++         continue;
++      } else if (is_reply_pool) {
++         /* EXPERIMENTAL (Faz 5, GPU-over-IP research): tried fully
++          * removing this branch (relying only on the active hint_size
++          * sync_now hook), reasoning the reply pool has no "stranded
++          * async data" scenario the way the ring does. That change was
++          * REVERTED -- measured strictly worse (10 minutes, only 8
++          * synchronous calls completed, ~485ms average vs. the ~63ms
++          * this 100ms-period version measured) even though real RTT to
++          * the host was re-checked and unchanged (~72-75ms) at the time,
++          * ruling out "the network got worse" as the explanation. Root
++          * cause not fully isolated before reverting -- suspect the
++          * active hook alone is, for reasons not yet understood, not a
++          * fully sufficient replacement despite the reasoning above. Kept
++          * at the already-validated 100ms period (down from the original
++          * 2ms, which caused the mutex-starvation hang documented in
++          * experiments/phase4-wan-aws/05-*.md) rather than either
++          * extreme. */
++         mtx_lock(&vtest->sock_mutex);
++         vtest_vcmd_transfer_get2(vtest, res_id, ptr, size, 0);
++         mtx_unlock(&vtest->sock_mutex);
++      } else {
++         mtx_lock(&vtest->sock_mutex);
++         vtest_vcmd_transfer_put2(vtest, res_id, ptr, size, 0);
++         vtest_vcmd_transfer_get2(vtest, res_id, ptr, size, 0);
++         mtx_unlock(&vtest->sock_mutex);
++      }
++
++      /* EXPERIMENTAL: a bare thrd_yield() here (previous version) caused a
++       * hard mutex-starvation bug -- the ring thread's cycle is unlock,
++       * immediately yield, immediately relock, which on Linux's
++       * non-FIFO/non-fair pthread mutex let it win the lock back against
++       * a competing thread (the reply-pool thread) essentially every
++       * single time (a classic "lock convoy"): over a full ~20s run the
++       * reply-pool thread never won the mutex even once, so the client
++       * only ever saw its reply buffer's untouched, all-zero initial
++       * mapping -- explaining the "vn_decode_..._reply: Assertion
++       * command_type == ... failed" corruption even after the ring's own
++       * ordering/ownership fixes. A short real sleep gives the OS an
++       * actual scheduling gap so other sync threads get a fair turn.
++       * Performance still doesn't matter, only correctness. Note: the
++       * ring sleeps short (it's the critical path -- everything else
++       * waits on it) while the reply-pool thread sleeps longer, so it
++       * doesn't out-compete the ring for the shared mutex; it only needs
++       * to eventually catch up once the ring has actually delivered
++       * something for the host to reply to. */
++      /* EXPERIMENTAL (Faz 5, GPU-over-IP research): the reply-pool branch
++       * above does a BLIND, full 1MB GET every time it runs -- unlike the
++       * ring, it has no delta tracking (it can't: the active sync_now
++       * hook already does the real, hint-sized delta pull keyed off
++       * reply_shmem_pool.used, which this background thread has no access
++       * to). At the old 2ms period this meant a full 1MB round trip
++       * fired roughly every 2ms REGARDLESS of whether anything had
++       * actually changed -- over a real WAN link this was a large,
++       * continuous, mostly-wasted stream of traffic and mutex contention
++       * competing with the real work (observed in vkcube's server-side
++       * log: hundreds of repeated "transfer_get ... offset=0
++       * size=1048576" lines). This background copy is only a safety net
++       * for the rare case the active hook missed something; it doesn't
++       * need to run anywhere near that often. */
++      struct timespec ts = {
++         .tv_nsec = is_reply_pool ? 100 * 1000 * 1000 /* 100ms */
++                                   : 200 * 1000 /* 200us */,
++      };
++      thrd_sleep(&ts, NULL);
++   }
++   return 0;
++}
++
+ static uint32_t
+ vtest_vcmd_resource_create_blob(struct vtest *vtest,
+                                 enum vcmd_blob_type type,
+@@ -350,7 +780,10 @@ vtest_vcmd_resource_create_blob(struct vtest *vtest,
+    uint32_t res_id;
+    vtest_read(vtest, &res_id, sizeof(res_id));
+ 
+-   *res_fd = vtest_receive_fd(vtest);
++   /* EXPERIMENTAL (Faz 3): SCM_RIGHTS fd-passing does not exist over TCP;
++    * the caller (vtest_shmem_create) is responsible for using a local
++    * anonymous mapping + transfer_get2/put2 sync instead in that case. */
++   *res_fd = vtest->is_tcp ? -1 : vtest_receive_fd(vtest);
+ 
+    return res_id;
+ }
+@@ -483,6 +916,23 @@ vtest_vcmd_sync_wait(struct vtest *vtest,
+    assert(vtest_hdr[VTEST_CMD_LEN] == 0);
+    assert(vtest_hdr[VTEST_CMD_ID] == VCMD_SYNC_WAIT);
+ 
++   /* EXPERIMENTAL (Faz 3, GPU-over-IP research): unlike the blob-memory fds
++    * (routed around via our own TCP resource sync), this fd is a real
++    * eventfd the server uses to signal async completion -- the client is
++    * meant to poll() it. There is no SCM_RIGHTS on TCP, so we cannot
++    * receive it at all; skip trying (this was the one remaining spot that
++    * still called vtest_receive_fd() unconditionally, and blocked forever
++    * in recvmsg() during vulkaninfo's vkDestroyInstance teardown -- see
++    * experiments/phase3-lan-transport/06-*.md). Caller (vtest_wait) treats
++    * -1 as "can't poll, so don't -- assume ready" instead of calling
++    * sync_wait_poll(). This is a real, deliberately scoped shortcut: a
++    * true async wait (blocking mid-render for a fence that ISN'T already
++    * signaled) has no correctness guarantee here, only enumeration/simple
++    * synchronous-call workloads are proven so far. Faz 5 would need a
++    * proper host-to-guest notification channel to do this right. */
++   if (vtest->is_tcp)
++      return -1;
++
+    return vtest_receive_fd(vtest);
+ }
+ 
+@@ -611,20 +1061,50 @@ vtest_sync_create(struct vn_renderer *renderer,
+ 
+ static void
+ vtest_bo_invalidate(struct vn_renderer *renderer,
+-                    struct vn_renderer_bo *bo,
++                    struct vn_renderer_bo *_bo,
+                     VkDeviceSize offset,
+                     VkDeviceSize size)
+ {
+-   /* nop */
++   /* EXPERIMENTAL (Faz 4, GPU-over-IP research): a real no-op when the
++    * mapping is true shared memory (host and guest already see the same
++    * pages). Over TCP the mapping is a private anonymous copy, so "the
++    * guest is about to read [offset, offset+size)" means we must first
++    * pull whatever the host has most recently written there -- the exact
++    * same PUT/GET-over-transfer2 pattern already proven for the ring and
++    * reply-pool shmems, just addressed at this bo's own res_id/offset
++    * instead of the ring's fixed layout. */
++   struct vtest *vtest = (struct vtest *)renderer;
++   struct vtest_bo *bo = (struct vtest_bo *)_bo;
++   if (!vtest->is_tcp || bo->res_fd >= 0 || !bo->base.mmap_ptr || !size)
++      return;
++
++   mtx_lock(&vtest->sock_mutex);
++   vtest_vcmd_transfer_get2(vtest, bo->base.res_id,
++                            (char *)bo->base.mmap_ptr + offset,
++                            (uint32_t)size, (uint32_t)offset);
++   mtx_unlock(&vtest->sock_mutex);
+ }
+ 
+ static void
+ vtest_bo_flush(struct vn_renderer *renderer,
+-               struct vn_renderer_bo *bo,
++               struct vn_renderer_bo *_bo,
+                VkDeviceSize offset,
+                VkDeviceSize size)
+ {
+-   /* nop */
++   /* EXPERIMENTAL (Faz 4, GPU-over-IP research): see vtest_bo_invalidate.
++    * "the guest just finished writing [offset, offset+size)" -- push it to
++    * the host's copy now instead of relying on any shared-memory
++    * coherence that doesn't exist over TCP. */
++   struct vtest *vtest = (struct vtest *)renderer;
++   struct vtest_bo *bo = (struct vtest_bo *)_bo;
++   if (!vtest->is_tcp || bo->res_fd >= 0 || !bo->base.mmap_ptr || !size)
++      return;
++
++   mtx_lock(&vtest->sock_mutex);
++   vtest_vcmd_transfer_put2(vtest, bo->base.res_id,
++                            (char *)bo->base.mmap_ptr + offset,
++                            (uint32_t)size, (uint32_t)offset);
++   mtx_unlock(&vtest->sock_mutex);
+ }
+ 
+ static void *
+@@ -639,21 +1119,32 @@ vtest_bo_map(struct vn_renderer *renderer,
+ 
+    /* not thread-safe but is fine */
+    if (!bo->base.mmap_ptr && mappable) {
+-      /* We wrongly assume that mmap(dma_buf) and vkMapMemory(VkDeviceMemory)
+-       * are equivalent when the blob type is VCMD_BLOB_TYPE_HOST3D.  While we
+-       * check for VCMD_PARAM_HOST_COHERENT_DMABUF_BLOB, we know vtest can
+-       * lie.
+-       */
+-      void *ptr =
+-         mmap(placed_addr, bo->base.mmap_size, PROT_READ | PROT_WRITE,
+-              MAP_SHARED | (placed_addr ? MAP_FIXED : 0), bo->res_fd, 0);
++      /* EXPERIMENTAL (Faz 4, GPU-over-IP research): no real fd over TCP
++       * (see vtest_bo_create_from_device_memory) -- fall back to a private
++       * anonymous mapping, same as vtest_shmem_create() already does for
++       * the ring/reply-pool shmems. flush()/invalidate() below keep it
++       * approximately coherent with the host's real copy via the wire. */
++      void *ptr;
++      if (bo->res_fd < 0) {
++         ptr = mmap(placed_addr, bo->base.mmap_size, PROT_READ | PROT_WRITE,
++                    MAP_PRIVATE | MAP_ANONYMOUS | (placed_addr ? MAP_FIXED : 0),
++                    -1, 0);
++      } else {
++         /* We wrongly assume that mmap(dma_buf) and vkMapMemory(VkDeviceMemory)
++          * are equivalent when the blob type is VCMD_BLOB_TYPE_HOST3D.  While we
++          * check for VCMD_PARAM_HOST_COHERENT_DMABUF_BLOB, we know vtest can
++          * lie.
++          */
++         ptr = mmap(placed_addr, bo->base.mmap_size, PROT_READ | PROT_WRITE,
++                    MAP_SHARED | (placed_addr ? MAP_FIXED : 0), bo->res_fd, 0);
++      }
+       if (ptr == MAP_FAILED) {
+          vn_log(vtest->instance, "failed to mmap %d of size %zu rw: %s",
+                 bo->res_fd, bo->base.mmap_size, strerror(errno));
+       } else {
+          bo->base.mmap_ptr = ptr;
+          /* we don't need the fd anymore */
+-         if (!shareable) {
++         if (!shareable && bo->res_fd >= 0) {
+             close(bo->res_fd);
+             bo->res_fd = -1;
+          }
+@@ -725,7 +1216,14 @@ vtest_bo_create_from_device_memory(
+    int res_fd;
+    uint32_t res_id = vtest_vcmd_resource_create_blob(
+       vtest, VCMD_BLOB_TYPE_HOST3D, blob_flags, size, mem_id, &res_fd);
+-   assert(res_id > 0 && res_fd >= 0);
++   /* EXPERIMENTAL (Faz 4, GPU-over-IP research): same fd-less situation as
++    * vtest_shmem_create() over TCP -- no SCM_RIGHTS, so vtest_bo_map()
++    * below falls back to an anonymous mapping instead of mmap(res_fd), and
++    * vtest_bo_flush()/invalidate() (real no-ops when true shared memory
++    * exists) instead do a transfer_put2/get2 over the wire to keep it
++    * approximately coherent with the host's copy. res_id is still real
++    * (needed to address this resource in transfer commands). */
++   assert(res_id > 0 && (res_fd >= 0 || vtest->is_tcp));
+    mtx_unlock(&vtest->sock_mutex);
+ 
+    struct vtest_bo *bo = util_sparse_array_get(&vtest->bo_array, res_id);
+@@ -751,6 +1249,12 @@ vtest_shmem_destroy_now(struct vn_renderer *renderer,
+    struct vtest *vtest = (struct vtest *)renderer;
+    struct vtest_shmem *shmem = (struct vtest_shmem *)_shmem;
+ 
++   if (shmem->sync_active) {
++      atomic_store_explicit(&shmem->sync_running, false, memory_order_release);
++      thrd_join(shmem->sync_thread, NULL);
++      shmem->sync_active = false;
++   }
++
+    munmap(shmem->base.mmap_ptr, shmem->base.mmap_size);
+ 
+    mtx_lock(&vtest->sock_mutex);
+@@ -770,6 +1274,102 @@ vtest_shmem_destroy(struct vn_renderer *renderer,
+    vtest_shmem_destroy_now(&vtest->base, shmem);
+ }
+ 
++/* EXPERIMENTAL (Faz 3): see the comment on vn_renderer_shmem_ops::sync_now
++ * (vn_renderer.h). Only meaningful for TCP-mode shmems that have a
++ * background sync thread (sync_active); a no-op otherwise (e.g. real
++ * fd-backed shared memory needs no such pull, it's already coherent).
++ * Safe to call concurrently with the background thread's own cycles --
++ * both just serialize on the same vtest->sock_mutex, this merely adds one
++ * extra, well-timed cycle.
++ *
++ * Two call sites, two directions:
++ * - vn_ring_wait_seqno() (vn_ring.c): calls this on the REPLY-POOL shmem
++ *   right when it observes seqno success, to force-pull a reply the host
++ *   is now guaranteed to have already written (closes the happens-before
++ *   gap described in experiments/phase3-lan-transport/05-*.md). For that
++ *   shmem this must stay GET-only (host-authored, guest never writes it).
++ * - vn_ring_submit_internal() (vn_ring.c): calls this on the RING's own
++ *   shmem right after writing new command data locally, to push it out
++ *   immediately instead of waiting for the background thread's next
++ *   ~200us tick -- this is what was making vkEnumeratePhysicalDevices (and
++ *   any call after the first) crawl. For the ring this MUST use the
++ *   field-aware, ownership-respecting vtest_shmem_sync_ring_cycle() (never
++ *   a blind full GET, which would stomp the guest-owned bytes we just
++ *   wrote with the host's older copy) -- detected the same way the
++ *   background thread does, by the ring's fixed shmem size. */
++static void
++vtest_shmem_sync_now(struct vn_renderer *renderer,
++                     struct vn_renderer_shmem *_shmem,
++                     size_t hint_size)
++{
++   struct vtest *vtest = (struct vtest *)renderer;
++   struct vtest_shmem *shmem = (struct vtest_shmem *)_shmem;
++
++   if (!shmem->sync_active)
++      return;
++
++   /* TEMP PROFILING (Faz 4, AWS WAN debugging): measure real wall time of
++    * each sync_now round trip to find out whether the 430s+ full-run time
++    * over real internet (vs 81s over 40ms tc netem) is dominated by actual
++    * network I/O or by something else (vn_relax backoff, retries, etc). */
++   struct timespec _t0, _t1;
++   clock_gettime(CLOCK_MONOTONIC, &_t0);
++   const bool _is_ring = shmem->base.mmap_size == VN_RING_SHMEM_SIZE;
++
++   if (_is_ring) {
++      vtest_shmem_sync_ring_cycle(vtest, shmem);
++   } else if (hint_size > 0 && hint_size <= shmem->base.mmap_size) {
++      /* EXPERIMENTAL (Faz 4, AWS WAN perf, corrected): pull only the new
++       * [last_synced_size, hint_size) span -- see the struct field comment
++       * for why re-pulling [0, hint_size) every time was wrong. */
++      if (hint_size > shmem->last_synced_size) {
++         const uint32_t get_offset = (uint32_t)shmem->last_synced_size;
++         const uint32_t pull_size =
++            (uint32_t)(hint_size - shmem->last_synced_size);
++         mtx_lock(&vtest->sock_mutex);
++         vtest_vcmd_transfer_get2(vtest, shmem->base.res_id,
++                                  shmem->base.mmap_ptr + get_offset,
++                                  pull_size, get_offset);
++         mtx_unlock(&vtest->sock_mutex);
++         shmem->last_synced_size = hint_size;
++      }
++   } else {
++      mtx_lock(&vtest->sock_mutex);
++      vtest_vcmd_transfer_get2(vtest, shmem->base.res_id, shmem->base.mmap_ptr,
++                               (uint32_t)shmem->base.mmap_size, 0);
++      mtx_unlock(&vtest->sock_mutex);
++   }
++
++   clock_gettime(CLOCK_MONOTONIC, &_t1);
++   const long _us = (_t1.tv_sec - _t0.tv_sec) * 1000000L +
++                    (_t1.tv_nsec - _t0.tv_nsec) / 1000L;
++   fprintf(stderr, "[PROF] sync_now is_ring=%d us=%ld\n", _is_ring, _us);
++}
++
++/* EXPERIMENTAL (Faz 4, AWS WAN correctness fix): see the comment on
++ * vn_renderer_shmem_ops::lock in vn_renderer.h. Reuses sock_mutex (now
++ * recursive, see mtx_init) -- the same mutex vtest_shmem_sync_ring_cycle()
++ * takes, so a caller holding this lock across its own write and then
++ * calling sync_now (which re-enters the same mutex) works, while the
++ * background sync thread calling vtest_shmem_sync_ring_cycle() on its own
++ * genuinely blocks until the writer unlocks. */
++static void
++vtest_shmem_lock(struct vn_renderer *renderer, struct vn_renderer_shmem *_shmem)
++{
++   struct vtest *vtest = (struct vtest *)renderer;
++   (void)_shmem;
++   mtx_lock(&vtest->sock_mutex);
++}
++
++static void
++vtest_shmem_unlock(struct vn_renderer *renderer,
++                   struct vn_renderer_shmem *_shmem)
++{
++   struct vtest *vtest = (struct vtest *)renderer;
++   (void)_shmem;
++   mtx_unlock(&vtest->sock_mutex);
++}
++
+ static struct vn_renderer_shmem *
+ vtest_shmem_create(struct vn_renderer *renderer, size_t size)
+ {
+@@ -787,12 +1387,21 @@ vtest_shmem_create(struct vn_renderer *renderer, size_t size)
+    uint32_t res_id = vtest_vcmd_resource_create_blob(
+       vtest, vtest->shmem_blob_mem, VCMD_BLOB_FLAG_MAPPABLE, size, 0,
+       &res_fd);
+-   assert(res_id > 0 && res_fd >= 0);
++   assert(res_id > 0 && (res_fd >= 0 || (vtest->is_tcp && res_fd == -1)));
+    mtx_unlock(&vtest->sock_mutex);
+ 
+-   void *ptr =
+-      mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, res_fd, 0);
+-   close(res_fd);
++   void *ptr;
++   if (res_fd >= 0) {
++      ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, res_fd, 0);
++      close(res_fd);
++   } else {
++      /* EXPERIMENTAL (Faz 3): TCP mode, no fd to share -- use local
++       * anonymous memory kept approximately in sync via a background
++       * transfer_get2/put2 polling thread (see
++       * vtest_shmem_sync_thread_func). */
++      ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
++                MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++   }
+    if (ptr == MAP_FAILED) {
+       mtx_lock(&vtest->sock_mutex);
+       vtest_vcmd_resource_unref(vtest, res_id);
+@@ -811,6 +1420,17 @@ vtest_shmem_create(struct vn_renderer *renderer, size_t size)
+       },
+    };
+ 
++   if (res_fd < 0 && getenv("VTEST_TCP_NO_SYNC_THREAD") == NULL) {
++      shmem->sync_vtest = vtest;
++      atomic_init(&shmem->sync_running, true);
++      if (thrd_create(&shmem->sync_thread, vtest_shmem_sync_thread_func,
++                      shmem) == thrd_success) {
++         shmem->sync_active = true;
++      } else {
++         vn_log(vtest->instance, "failed to start tcp shmem sync thread");
++      }
++   }
++
+    return &shmem->base;
+ }
+ 
+@@ -859,6 +1479,12 @@ vtest_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
+                            wait->sync_values, wait->sync_count);
+    mtx_unlock(&vtest->sock_mutex);
+ 
++   /* EXPERIMENTAL (Faz 3): see the comment in vtest_vcmd_sync_wait(). No fd
++    * to poll on TCP -- treat as already satisfied rather than blocking
++    * forever trying to poll() an invalid fd. */
++   if (fd < 0)
++      return VK_SUCCESS;
++
+    VkResult result = sync_wait_poll(fd, poll_timeout);
+    close(fd);
+ 
+@@ -988,14 +1614,26 @@ vtest_init(struct vtest *vtest)
+                           1024);
+    util_sparse_array_init(&vtest->bo_array, sizeof(struct vtest_bo), 1024);
+ 
+-   mtx_init(&vtest->sock_mutex, mtx_plain);
++   /* EXPERIMENTAL (Faz 4, AWS WAN correctness fix): recursive because the
++    * new shmem_ops.lock/unlock hooks (called by vn_ring_submit_internal
++    * around its write-then-publish sequence) and
++    * vtest_shmem_sync_ring_cycle() (which the lock/unlock caller may go on
++    * to invoke via sync_now, and which independently takes this same
++    * mutex when the background thread calls it on its own) both use this
++    * mutex -- without mtx_recursive, the ring-submit thread would
++    * self-deadlock locking it twice. */
++   mtx_init(&vtest->sock_mutex, mtx_plain | mtx_recursive);
+ 
+    /* disallow VTEST_DEFAULT_SOCKET_NAME on vtest fallback */
+    if (!VN_DEBUG(VTEST) && !socket_name)
+       return VK_ERROR_INITIALIZATION_FAILED;
+ 
+-   vtest->sock_fd = vtest_connect_socket(
+-      vtest->instance, socket_name ? socket_name : VTEST_DEFAULT_SOCKET_NAME);
++   const char *effective_socket_name =
++      socket_name ? socket_name : VTEST_DEFAULT_SOCKET_NAME;
++   vtest->is_tcp = !strncmp(effective_socket_name, "tcp:", 4);
++
++   vtest->sock_fd =
++      vtest_connect_socket(vtest->instance, effective_socket_name);
+    if (vtest->sock_fd < 0)
+       return VK_ERROR_INITIALIZATION_FAILED;
+ 
+@@ -1029,6 +1667,9 @@ vtest_init(struct vtest *vtest)
+ 
+    vtest->base.shmem_ops.create = vtest_shmem_create;
+    vtest->base.shmem_ops.destroy = vtest_shmem_destroy;
++   vtest->base.shmem_ops.sync_now = vtest_shmem_sync_now;
++   vtest->base.shmem_ops.lock = vtest_shmem_lock;
++   vtest->base.shmem_ops.unlock = vtest_shmem_unlock;
+ 
+    vtest->base.bo_ops.create_from_device_memory =
+       vtest_bo_create_from_device_memory;
+diff --git a/src/virtio/vulkan/vn_ring.c b/src/virtio/vulkan/vn_ring.c
+index d53f904..9f9687d 100644
+--- a/src/virtio/vulkan/vn_ring.c
++++ b/src/virtio/vulkan/vn_ring.c
+@@ -196,9 +196,49 @@ vn_ring_wait_seqno(struct vn_ring *ring, uint32_t seqno)
+                                           ? VN_RELAX_REASON_RING_SEQNO
+                                           : VN_RELAX_REASON_TLS_RING_SEQNO;
+    struct vn_relax_state relax_state = vn_relax_init(ring->instance, reason);
++   /* EXPERIMENTAL (Faz 5 optimization, GPU-over-IP research): a sync_now
++    * pull is a real, BLOCKING network round trip over the TCP transport --
++    * unlike vn_relax's own busy-wait phase (up to 256 near-instant
++    * thrd_yield() iterations, designed assuming cheap checks), doing one
++    * on every single loop iteration meant the busy-wait phase alone could
++    * cost up to 256 round trips before backoff even started. Over
++    * simulated WAN latency (tc netem, see
++    * experiments/phase3-lan-transport/08-*.md) this dominated the total
++    * time (measured: 81s at 40ms one-way delay for a full vulkaninfo run).
++    * Throttle to every 4th iteration -- the loop still spins fast on the
++    * cheap iterations in between (thrd_yield(), no network I/O), and
++    * still re-checks vn_ring_get_seqno_status() using whichever data we
++    * last actually pulled, so correctness is unaffected (a real pull is
++    * still guaranteed on the very first iteration, iter==0). */
++   uint32_t pull_iter = 0;
+    do {
++      if ((pull_iter++ % 4) == 0) {
++         vn_renderer_shmem_sync_now(ring->instance->renderer, ring->shmem, 0);
++      }
+       if (vn_ring_get_seqno_status(ring, seqno)) {
+          vn_relax_fini(&relax_state);
++         /* EXPERIMENTAL (Faz 3, GPU-over-IP research): the host never
++          * advances the ring seqno before it has finished writing any
++          * reply a just-consumed command produced (Venus's own ordering
++          * guarantee), so the instant we observe seqno reached here, the
++          * host's reply -- if any -- is definitely ready. Force a
++          * synchronous refresh of the reply pool's local mapping right
++          * now instead of trusting a background poll thread's cadence to
++          * have already caught up; closes a happens-before gap that was
++          * causing intermittent garbage/zeroed replies over the TCP
++          * transport (see experiments/phase3-lan-transport/04-*.md). A
++          * no-op for renderers that don't set shmem_ops.sync_now.
++          *
++          * EXPERIMENTAL (Faz 4, AWS WAN perf): pass reply_shmem_pool.used
++          * as a size hint -- the host can never have written past what we
++          * ourselves allocated out of this pool for replies so far, so
++          * pulling only that many bytes instead of the full fixed 1MB
++          * pool is safe and, over a real WAN link, was ~85% of a
++          * dominant ~800ms-per-call cost (see experiments/phase4-wan-aws/).
++          */
++         vn_renderer_shmem_sync_now(ring->instance->renderer,
++                                    ring->instance->reply_shmem_pool.shmem,
++                                    ring->instance->reply_shmem_pool.used);
+          return;
+       }
+       vn_relax(&relax_state);
+@@ -457,11 +497,62 @@ vn_ring_submit_internal(struct vn_ring *ring,
+ 
+    for (uint32_t i = 0; i < cs->buffer_count; i++) {
+       const struct vn_cs_encoder_buffer *buf = &cs->buffers[i];
++      /* wait_space must stay OUTSIDE the lock: it blocks until the host's
++       * head has advanced far enough, and that head value is only ever
++       * refreshed by the renderer's own background sync thread -- which
++       * needs the lock to do so. Holding the lock across wait_space would
++       * deadlock the background thread out of ever updating head. */
+       cur_seqno = vn_ring_wait_space(ring, buf->committed_size);
++      /* EXPERIMENTAL (Faz 4, AWS WAN correctness fix): lock out the
++       * renderer's own background shmem copier while we write -- see the
++       * comment on vn_renderer_shmem_ops::lock in vn_renderer.h for the
++       * corruption this closes (background thread PUTting a
++       * partially-written ring buffer to the host). */
++      vn_renderer_shmem_lock(ring->instance->renderer, ring->shmem);
+       vn_ring_write_buffer(ring, buf->base, buf->committed_size);
++      vn_renderer_shmem_unlock(ring->instance->renderer, ring->shmem);
+    }
+ 
++   /* EXPERIMENTAL (Faz 4): also lock across store_tail + the sync_now push
++    * below -- the tail publish and the push must be seen as one atomic
++    * unit by the background thread too, or it could PUT a buffer whose
++    * bytes are all correct but whose tail it reads mid-store (torn read
++    * on a non-atomic-width field is not the concern here since tail is a
++    * single atomic store; the concern is a background PUT landing between
++    * this store_tail and our own sync_now push using a tail the host
++    * hasn't been told about yet by us, so it observes it from the
++    * background thread's independent, potentially-stale full copy). */
++   vn_renderer_shmem_lock(ring->instance->renderer, ring->shmem);
+    vn_ring_store_tail(ring);
++   vn_renderer_shmem_unlock(ring->instance->renderer, ring->shmem);
++   /* EXPERIMENTAL (Faz 5, GPU-over-IP research, pipelining v2): Faz 3 had
++    * an unconditional network push right here after every single submit
++    * (sync or async), and Faz 5's first attempt at removing it (see
++    * experiments/phase3-lan-transport/10-*.md) broke correctness -- at
++    * that point in the project there was no other delivery path at all
++    * (the ring background thread had been removed entirely, see Bug #8 in
++    * experiments/phase3-lan-transport/07-*.md), so an async-only sequence
++    * with no following sync call could strand its data in local memory
++    * forever.
++    *
++    * Two things changed since then that make removing the push safe now:
++    * (1) the ring background thread was reinstated as a low-frequency
++    * (5ms) safety net (experiments/phase3-lan-transport/11-*.md) -- any
++    * stranded async data now has a bounded (~5ms) worst-case delivery
++    * delay instead of "never"; (2) this function's own write path is now
++    * lock-protected against that same background thread (see the lock
++    * calls above and in vn_renderer.h), so the background thread picking
++    * up in-flight data mid-write can no longer corrupt it.
++    *
++    * With those two safety nets in place, skipping this push entirely and
++    * relying on (a) vn_ring_wait_seqno()'s own push+pull cycle -- called
++    * for every SYNC command, which now naturally batches this command's
++    * data together with any preceding async commands' data that hadn't
++    * been pushed yet -- and (b) the background thread for pure
++    * fire-and-forget async bursts, is real pipelining: N consecutive
++    * async commands followed by one sync command now cost ~1 round trip
++    * instead of N+1. See experiments/phase4-wan-aws/ for before/after
++    * measurements. */
+    const VkRingStatusFlagsMESA status = vn_ring_load_status(ring);
+    if (status & VK_RING_STATUS_FATAL_BIT_MESA) {
+       vn_log(NULL, "vn_ring_submit abort on fatal");
+-- 
+2.56.0
+

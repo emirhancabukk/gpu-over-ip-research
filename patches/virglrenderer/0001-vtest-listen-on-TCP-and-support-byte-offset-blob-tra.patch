@@ -1,0 +1,340 @@
+From 82fb593fa00f226a64409d0b99a76bb72df17b52 Mon Sep 17 00:00:00 2001
+From: Emirhan Cabuk <emirhancabuk30@gmail.com>
+Date: Mon, 31 Aug 2026 16:33:20 +0300
+Subject: [PATCH] vtest: listen on TCP and support byte-offset blob transfers
+
+Server side of running the Venus protocol over a plain TCP socket
+instead of a Unix domain socket.
+
+- vtest_server_open_socket_tcp: listen on "tcp:<port>", set TCP_NODELAY
+  on the accepted client socket.
+- transfer_get/put_internal: virgl_renderer_transfer_*_iov fails for
+  blob resources (the box-copy API assumes classic textures), so map the
+  blob and memcpy through res->iov directly.
+- Carry a byte offset in the otherwise unused box.x field, since the
+  legacy TRANSFER_GET/PUT opcodes (4/5) have no offset field. The
+  newer GET2/PUT2 opcodes (13/14) never read data_size and always
+  transferred zero bytes, so they are not usable here.
+- vkr_ring: adjustments for the emulated, periodically synchronised
+  ring rather than truly shared memory.
+
+Base: 7fcfce4 (upstream/main)
+---
+ src/venus/vkr_ring.c   |  17 +++++
+ vtest/vtest_renderer.c | 140 ++++++++++++++++++++++++++++++++++-------
+ vtest/vtest_server.c   |  53 ++++++++++++++++
+ 3 files changed, 188 insertions(+), 22 deletions(-)
+
+diff --git a/src/venus/vkr_ring.c b/src/venus/vkr_ring.c
+index 0d4899e..da5314b 100644
+--- a/src/venus/vkr_ring.c
++++ b/src/venus/vkr_ring.c
+@@ -230,6 +230,23 @@ vkr_ring_submit_cmd(struct vkr_ring *ring,
+       vn_dispatch_command(&ring->dispatch);
+       if (vkr_cs_decoder_get_fatal(dec)) {
+          vkr_log("ring_submit_cmd: vn_dispatch_command failed");
++         {
++            /* EXPERIMENTAL (Faz 3, GPU-over-IP research): dump what the
++             * decoder was actually looking at, to distinguish "genuinely
++             * corrupt/torn bytes arrived" from "well-formed bytes the
++             * decoder just doesn't recognize" (e.g. wrong cursor/size). */
++            size_t dump_len = size < 64 ? size : 64;
++            char hex[64 * 3 + 1];
++            size_t hoff = 0;
++            for (size_t i = 0; i < dump_len; i++) {
++               hoff += snprintf(hex + hoff, sizeof(hex) - hoff, "%02x ",
++                                 buffer[i]);
++            }
++            vkr_log("ring_submit_cmd: fatal at dec->cur offset=%zu/%zu size=%zu "
++                    "ring_head=%u first_%zu_bytes: %s",
++                    (size_t)(dec->cur - buffer), size, size, ring_head,
++                    dump_len, hex);
++         }
+ 
+          vkr_cs_decoder_reset(dec);
+          return false;
+diff --git a/vtest/vtest_renderer.c b/vtest/vtest_renderer.c
+index ba4feb1..4581fd5 100644
+--- a/vtest/vtest_renderer.c
++++ b/vtest/vtest_renderer.c
+@@ -33,6 +33,7 @@
+ #include <unistd.h>
+ #include <fcntl.h>
+ #include <limits.h>
++#include <stdatomic.h>
+ #include <c11/threads.h>
+ 
+ #include "virgl_hw.h"
+@@ -444,6 +445,25 @@ static int vtest_send_fd(int socket_fd, int fd)
+     struct msghdr msgh = { 0 };
+     memset(buf, 0, sizeof(buf));
+ 
++    /* EXPERIMENTAL (Faz 3, GPU-over-IP research): SCM_RIGHTS fd-passing
++     * only exists on AF_UNIX sockets. On a TCP socket, sendmsg() here
++     * silently drops the ancillary data but still sends the 1-byte dummy
++     * iov payload -- a phantom byte the TCP-mode client never reads,
++     * which desyncs every subsequent command's framing (root-caused via
++     * gdb backtrace + tracing; see experiments/phase3-lan-transport/).
++     * Skip entirely for non-unix sockets; the TCP-mode client already
++     * knows not to expect an fd here (see vtest_receive_fd skip on the
++     * client side for the paths that matter, e.g. resource_create_blob).
++     */
++    {
++       struct sockaddr_storage ss;
++       socklen_t sl = sizeof(ss);
++       if (getsockname(socket_fd, (struct sockaddr *)&ss, &sl) == 0 &&
++           ss.ss_family != AF_UNIX) {
++          return 0;
++       }
++    }
++
+     iovec.iov_base = &c;
+     iovec.iov_len = sizeof(char);
+ 
+@@ -764,6 +784,7 @@ int vtest_create_context(struct vtest_input *input, int out_fd,
+    }
+ 
+    ret = ctx->input->read(ctx->input, vtestname, length);
++   fprintf(stderr, "[DEBUG] vtest_create_context: expected length=%u read_ret=%d\n", length, ret);
+    if (ret != (int)length) {
+       ret = -1;
+       goto err;
+@@ -802,6 +823,8 @@ int vtest_lazy_init_context(struct vtest_context *ctx)
+                                           strlen(ctx->debug_name),
+                                           ctx->debug_name);
+    }
++   fprintf(stderr, "[DEBUG] vtest_lazy_init_context: capset_id=%u ret=%d errno=%d (%s)\n",
++           ctx->capset_id, ret, errno, strerror(errno < 0 ? -errno : errno));
+    ctx->context_initialized = (ret == 0);
+ 
+    return ret;
+@@ -1418,6 +1441,24 @@ int vtest_resource_create_blob(UNUSED uint32_t length_dw)
+          vtest_unref_resource(res);
+          return report_failed_call("virgl_renderer_resource_export_blob", -EINVAL);
+       }
++
++      /* EXPERIMENTAL (Faz 3, GPU-over-IP research): HOST3D blobs never
++       * populate res->iov (unlike the GUEST/HOST3D_GUEST case above), so
++       * VCMD_TRANSFER_GET/PUT have nothing to read/write for them --
++       * confirmed by tracing virgl_renderer_transfer_write_iov() failing
++       * for these resources. mmap the exported fd here too (in addition to
++       * handing it to the client normally over unix sockets) so the server
++       * itself has a raw pointer transfer_get/put can use directly when
++       * SCM_RIGHTS isn't available (TCP transport). Safe no-op otherwise.
++       * See experiments/phase3-lan-transport/. */
++      if (fd_type == VIRGL_RENDERER_BLOB_FD_TYPE_SHM) {
++         void *ptr = mmap(NULL, args.size, PROT_READ | PROT_WRITE,
++                          MAP_SHARED, fd, 0);
++         if (ptr != MAP_FAILED) {
++            res->iov.iov_base = ptr;
++            res->iov.iov_len = args.size;
++         }
++      }
+    }
+ 
+    virgl_renderer_ctx_attach_resource(ctx->ctx_id, res->res_id);
+@@ -1593,17 +1634,46 @@ static int vtest_transfer_get_internal(struct vtest_context *ctx,
+    }
+ 
+    if (do_transfer) {
+-      ret = virgl_renderer_transfer_read_iov(res->res_id,
+-                                             ctx->ctx_id,
+-                                             args->level,
+-                                             args->stride,
+-                                             args->layer_stride,
+-                                             &args->box,
+-                                             args->offset,
+-                                             data_size ? &data_iov : NULL,
+-                                             data_size ? 1 : 0);
+-      if (ret) {
+-         report_failed_call("virgl_renderer_transfer_read_iov", ret);
++      /* EXPERIMENTAL (Faz 3): blob resources (e.g. the Venus ring) have no
++       * transfer_3d support in the Venus proxy context -- virgl_renderer_
++       * transfer_read_iov fails for them. If we have a local mapping of
++       * the resource (see the mmap added in vtest_resource_create_blob for
++       * HOST3D blobs), copy directly instead. */
++      if (res->iov.iov_base) {
++         /* EXPERIMENTAL (Faz 3): the legacy PUT/GET wire format has no real
++          * offset field (decode_args always sets args->offset=0), so our
++          * TCP-mode client repurposes the unused box.x field to carry a
++          * byte offset for our blob fast path -- see matching comment in
++          * vn_renderer_vtest.c's vtest_vcmd_transfer_put2/get2(). Only
++          * affects this blob memcpy path, not classic transfer_3d below. */
++         const uint64_t blob_offset = args->box.x;
++         if (data_size) {
++            if (blob_offset + data_size > res->iov.iov_len) {
++               ret = report_failure("transfer_get out of bounds", -EFAULT);
++            } else {
++               if (res->iov.iov_len == (1u << 20)) {
++                  const unsigned char *hb = (const unsigned char *)res->iov.iov_base + blob_offset;
++                  fprintf(stderr, "[DEBUG] server transfer_get on reply-pool res: handle=%u offset=%lu size=%u bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
++                          args->handle, (unsigned long)blob_offset, data_size,
++                          hb[0], hb[1], hb[2], hb[3], hb[4], hb[5], hb[6], hb[7]);
++               }
++               memcpy(data_iov.iov_base,
++                      (char *)res->iov.iov_base + blob_offset, data_size);
++            }
++         }
++      } else {
++         ret = virgl_renderer_transfer_read_iov(res->res_id,
++                                                ctx->ctx_id,
++                                                args->level,
++                                                args->stride,
++                                                args->layer_stride,
++                                                &args->box,
++                                                args->offset,
++                                                data_size ? &data_iov : NULL,
++                                                data_size ? 1 : 0);
++         if (ret) {
++            report_failed_call("virgl_renderer_transfer_read_iov", ret);
++         }
+       }
+    } else if (data_size) {
+       memset(data_iov.iov_base, 0, data_iov.iov_len);
+@@ -1649,17 +1719,43 @@ static int vtest_transfer_put_internal(struct vtest_context *ctx,
+    }
+ 
+    if (do_transfer) {
+-      ret = virgl_renderer_transfer_write_iov(res->res_id,
+-                                              ctx->ctx_id,
+-                                              args->level,
+-                                              args->stride,
+-                                              args->layer_stride,
+-                                              &args->box,
+-                                              args->offset,
+-                                              data_size ? &data_iov : NULL,
+-                                              data_size ? 1 : 0);
+-      if (ret) {
+-         report_failed_call("virgl_renderer_transfer_write_iov", ret);
++      /* EXPERIMENTAL (Faz 3): see matching comment in
++       * vtest_transfer_get_internal(). */
++      if (res->iov.iov_base) {
++         const uint64_t blob_offset = args->box.x;
++         if (data_size) {
++            if (blob_offset + data_size > res->iov.iov_len) {
++               ret = report_failure("transfer_put out of bounds", -EFAULT);
++            } else {
++               memcpy((char *)res->iov.iov_base + blob_offset,
++                      data_iov.iov_base, data_size);
++               /* EXPERIMENTAL (Faz 3, GPU-over-IP research, Hipotez B):
++                * this memcpy is on the vtest command-dispatch thread; the
++                * venus ring-consumer thread (vkr_ring_thread, a SEPARATE
++                * thread, see vkr_ring.c) reads this same memory only
++                * gated on the `tail` field being atomic -- there is no
++                * fence tying the *data* write to becoming visible before
++                * a later transfer_put's write to `tail` is observed by
++                * that other thread. Testing whether a release fence here
++                * (paired with the ring-consumer's acquire load of tail)
++                * closes the "last N bytes read as zero" corruption seen
++                * in experiments/phase3-lan-transport/06-*.md. */
++               atomic_thread_fence(memory_order_release);
++            }
++         }
++      } else {
++         ret = virgl_renderer_transfer_write_iov(res->res_id,
++                                                 ctx->ctx_id,
++                                                 args->level,
++                                                 args->stride,
++                                                 args->layer_stride,
++                                                 &args->box,
++                                                 args->offset,
++                                                 data_size ? &data_iov : NULL,
++                                                 data_size ? 1 : 0);
++         if (ret) {
++            report_failed_call("virgl_renderer_transfer_write_iov", ret);
++         }
+       }
+    }
+ 
+diff --git a/vtest/vtest_server.c b/vtest/vtest_server.c
+index 64a29e1..00776d8 100644
+--- a/vtest/vtest_server.c
++++ b/vtest/vtest_server.c
+@@ -34,6 +34,7 @@
+ #include <sys/types.h>
+ #include <sys/socket.h>
+ #include <netinet/in.h>
++#include <netinet/tcp.h>
+ #include <sys/un.h>
+ #include <fcntl.h>
+ #include <getopt.h>
+@@ -402,10 +403,49 @@ static void vtest_server_open_read_file(void)
+    }
+ }
+ 
++/* EXPERIMENTAL (Faz 3, GPU-over-IP research): if socket_name is "tcp:<port>",
++ * listen on a TCP port (all interfaces) instead of a unix domain socket, so
++ * this server can accept connections from a remote client over a real
++ * network instead of only from the same machine. */
++static void vtest_server_open_socket_tcp(const char *spec)
++{
++   const int port = atoi(spec + 4); /* skip "tcp:" */
++
++   server.socket = socket(AF_INET, SOCK_STREAM, 0);
++   if (server.socket < 0)
++      goto err;
++
++   const int one = 1;
++   setsockopt(server.socket, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
++
++   struct sockaddr_in addr;
++   memset(&addr, 0, sizeof(addr));
++   addr.sin_family = AF_INET;
++   addr.sin_addr.s_addr = INADDR_ANY;
++   addr.sin_port = htons((uint16_t)port);
++
++   if (bind(server.socket, (struct sockaddr *)&addr, sizeof(addr)) < 0)
++      goto err;
++
++   if (listen(server.socket, 1) < 0)
++      goto err;
++
++   return;
++
++err:
++   perror("Failed to setup tcp socket.");
++   exit(1);
++}
++
+ static void vtest_server_open_socket(void)
+ {
+    struct sockaddr_un un;
+ 
++   if (strncmp(server.socket_name, "tcp:", 4) == 0) {
++      vtest_server_open_socket_tcp(server.socket_name);
++      return;
++   }
++
+    server.socket = socket(PF_UNIX, SOCK_STREAM, 0);
+    if (server.socket < 0) {
+       goto err;
+@@ -494,6 +534,17 @@ static void vtest_server_wait_clients(void)
+          exit(1);
+       }
+ 
++      /* EXPERIMENTAL (Faz 4, GPU-over-IP research): the vtest wire protocol
++       * is a synchronous request/response stream over TCP (push, then wait
++       * for a reply). Without TCP_NODELAY, Nagle's algorithm on this
++       * accepted connection interacts with the client's delayed-ACK timer
++       * and adds tens of ms to every single round trip -- devastating over
++       * a real WAN link where hundreds of round trips happen per call. */
++      if (strncmp(server.socket_name, "tcp:", 4) == 0) {
++         const int one = 1;
++         setsockopt(new_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
++      }
++
+       if (vtest_server_add_client(new_fd, new_fd)) {
+          perror("Failed to add client.");
+          exit(1);
+@@ -788,6 +839,8 @@ static int vtest_client_dispatch_commands(struct vtest_client *client)
+    TRACE_SCOPE_END(trace_scope);
+ 
+    if (ret < 0) {
++      fprintf(stderr, "[DEBUG] dispatch failed: cmd=%s (opcode=%u) ret=%d\n",
++              cmd->name, header[1], ret);
+       return VTEST_CLIENT_ERROR_COMMAND_DISPATCH;
+    }
+ 
+-- 
+2.56.0
+
